@@ -1,5 +1,5 @@
  
-# Gridder- CUDA Implementation
+# Forward Solver (W-Projection based Gridding & Högbom CLEAN) 
 ###### Note: currently only supported by NVIDIA GPUs (limitation of CUDA)
 ---
 ##### Instructions for installation of this software (includes profiling, linting, building, and unit testing):
@@ -25,12 +25,12 @@
    ```bash
    $ sudo apt install cppcheck
    ```
-7. Configure the code for usage (**modify gridder config**)
+7. Configure the code for usage (**modify solver config**)
 8. Create local execution folder
     ```bash
    $ mkdir build && cd build
    ```
-9. Build gridder project (from project folder)
+9. Build solver project (from project folder)
    ```bash
    $ cmake .. -DCMAKE_BUILD_TYPE=Release && make
    ```
@@ -39,14 +39,14 @@
 ##### Instructions for usage of this software (includes executing, testing, linting, and profiling):
 To perform memory checking, memory leak analysis, and profiling using [Valgrind](http://valgrind.org/docs/manual/quick-start.html), execute the following (assumes you are in the appropriate *build* folder (see step 5 above):
 ```bash
-$ valgrind --leak-check=yes -v ./gridder
+$ valgrind --leak-check=yes -v ./solver
 ```
 To execute linting, execute the following commands (assumes you are in the appropriate source code folder):
 ```bash
 $ cppcheck --enable=all main.cpp
-$ cppcheck --enable=all gridder.cu
+$ cppcheck --enable=all solver.cu
 ```
-To execute the gridder (once configured and built), execute the following command (also assumes appropriate *build* folder):
+To execute the solver (once configured and built), execute the following command (also assumes appropriate *build* folder):
 ```bash
-$ ./gridder
+$ ./solver
 ```
