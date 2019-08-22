@@ -107,16 +107,11 @@ int main(int argc, char **argv)
 	    return EXIT_FAILURE;
 	}	
 
-
-	//This pointers to the output residual image and the output model sources
-	//PRECISION *residual_image = NULL;
-	Source *model_sources = NULL;
-
 	//need to allocate device 
 	PRECISION2 *d_input_grid;
 
 	int grid_size_square = config.grid_size * config.grid_size;
-	cudaMalloc((void**)&d_input_grid, sizeof(PRECISION2) * grid_size_square);
+	cudaMalloc((void**) &d_input_grid, sizeof(PRECISION2) * grid_size_square);
 	cudaDeviceSynchronize();
 
 
@@ -128,12 +123,7 @@ int main(int argc, char **argv)
 	printf(">>> UPDATE: Gridding complete...\n");
 
 	//clean up the inputs used for gridding - optional as later when doing major cycles we will take this out
-	
-
-//	clean_up_gridding_inputs(&grid, &vis_uvw, &vis_intensities, &kernel, &kernel_supports);
-
-
-
+	//	clean_up_gridding_inputs(&grid, &vis_uvw, &vis_intensities, &kernel, &kernel_supports);
 	// Complex *residual_image = (Complex*) calloc(config.grid_size*config.grid_size, sizeof(Complex));
 	// //final cleanup
 	// printf("COPY IMAGE FROM GPU ");
@@ -142,16 +132,13 @@ int main(int argc, char **argv)
 	// printf("SAVE IMAGE TO FILE ");
 	// save_complex_image_to_file(&config, residual_image, 0,config.grid_size,0,config.grid_size);
 
-
-
-
-
 	//execute FFT subroutine, now the output is all REAL
 	PRECISION *d_output_image;
 	cudaMalloc((void**)&d_output_image, sizeof(PRECISION) * grid_size_square);
 	cudaDeviceSynchronize();
 
 	execute_CUDA_iFFT(&config, d_input_grid, d_output_image);
+	CUDA_CHECK_RETURN(cudaFree(d_input_grid));
 
 	printf("UPDATE >>> Executing Convolution Correction ...\n");
 	execute_CC(&config, prolate, d_output_image);
@@ -171,9 +158,7 @@ int main(int argc, char **argv)
 
 	PRECISION *residual_image = (PRECISION*) calloc(config.grid_size*config.grid_size, sizeof(PRECISION));
 	copy_image_from_gpu(&config, d_output_image, residual_image);
-	save_image_to_file(&config, residual_image, 0,config.grid_size,0,config.grid_size);
-
-
+	save_image_to_file(&config, residual_image, 0,config.grid_size,0,config.grid_size, config.output_dirty_image);
 
 	// clean_up_gridding_inputs(&grid, &vis_uvw, &vis_intensities, &kernel, &kernel_supports);
 
@@ -183,16 +168,54 @@ int main(int argc, char **argv)
 	//printf("EXECUTING CC");
 	//execute_CC(&config, prolate, d_output_image);
 	
-//	free(prolate);
+	//	free(prolate);
+
 	//execute the deconvolution routine
+	printf(">>> INFO: Executing deconvolution module...\n\n");
 
+	// allocate host mem and load PSF from file
+	int psf_squared = config.psf_size * config.psf_size;
+	PRECISION *psf = (PRECISION*) calloc(psf_squared, sizeof(PRECISION));
+	load_image_from_file(psf, config.psf_size, config.psf_source_file);
 
-	//optional obtain residual image
+	// allocate gpu memory for model sources
+	PRECISION3 *d_sources;
+	CUDA_CHECK_RETURN(cudaMalloc((void**) &d_sources, sizeof(PRECISION3) * config.number_minor_cycles));
+	cudaDeviceSynchronize();
 
+	// execute deconvolution kernel
+	int number_of_sources_found = performing_deconvolution(&config, d_output_image, d_sources, psf);
 
-	//model sources
+	// free host bound psf memory
+	free(psf);
 
+	// allocate host mem for storing extracted sources
+	Source *model = (Source*) calloc(number_of_sources_found, sizeof(Source));
+
+	// copy sources from gpu to host
+	printf(">>> UPDATE: Copying %d extracted sources back from the GPU...\n\n", number_of_sources_found);
+	CUDA_CHECK_RETURN(cudaMemcpy(model, d_sources, number_of_sources_found * sizeof(Source),
+			cudaMemcpyDeviceToHost));
+	cudaDeviceSynchronize();
+
+	// copy residual image from gpu to host and save
+	copy_image_from_gpu(&config, d_output_image, residual_image);
+	save_image_to_file(&config, residual_image, 0, config.grid_size, 0, config.grid_size, config.output_residual_image);
+
+	// free up gpu memory
+	CUDA_CHECK_RETURN(cudaFree(d_sources));
+
+	// save sources to file
+	save_sources_to_file(model, number_of_sources_found, config.output_model_sources_file);
+
+	// free sources cpu memory
+	free(model);
+
+	printf(">>> INFO: Deconvolution complete...\n\n");
 	
+	CUDA_CHECK_RETURN(cudaFree(d_output_image));
+	CUDA_CHECK_RETURN(cudaDeviceReset());
+
 	//final cleanup
 	//printf("COPY IMAGE FROM GPU ");
 	//copy_image_from_gpu(&config, d_output_image, residual_image);
