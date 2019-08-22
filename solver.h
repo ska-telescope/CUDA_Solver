@@ -102,10 +102,11 @@ extern "C" {
 		// full solver configs
 		int grid_size;
 		double cell_size;
-		char *output_image_file;
+		char *output_dirty_image;
 		int gpu_max_threads_per_block;
 		int gpu_max_threads_per_block_dimension;
 		bool time_gridding;
+		bool time_deconvolution;
 		bool perform_iFFT_CC;
 		bool perform_deconvolution;
 
@@ -128,10 +129,11 @@ extern "C" {
 		unsigned int psf_size;
 		unsigned int number_minor_cycles;
 		double loop_gain;
-		char *model_source_file;
+		char *output_model_sources_file;
+		char *psf_source_file;
+		char *output_residual_image;
 		double weak_source_percent;
 		double noise_detection_factor;
-
 	} Config;
 
 	typedef struct Visibility {
@@ -155,7 +157,9 @@ extern "C" {
 	//GLOBAL FUNCTIONS
 	void init_config(Config *config);
 
-	void save_image_to_file(Config *config, PRECISION *grid, int startX, int rangeX, int startY, int rangeY);
+	void save_image_to_file(Config *config, PRECISION *grid, int startX, int rangeX, int startY, int rangeY, char *file_path);
+
+	bool load_image_from_file(PRECISION *image, unsigned int size, char *input_file);
 
 	void save_complex_image_to_file(Config *config, Complex *grid, int startX, int rangeX,int startY, int rangeY);
 
@@ -167,11 +171,11 @@ extern "C" {
 
 	void copy_complex_image_from_gpu(Config *config, PRECISION2 *d_image, Complex *output_image);
 
-	static void check_cuda_error_aux(const char *file, unsigned line, const char *statement, cudaError_t err);
+	void check_cuda_error_aux(const char *file, unsigned line, const char *statement, cudaError_t err);
 
-	static void cufft_safe_call(cufftResult err, const char *file, const int line);
+	void cufft_safe_call(cufftResult err, const char *file, const int line);
 
-	static const char* cuda_get_error_enum(cufftResult error);
+	const char* cuda_get_error_enum(cufftResult error);
 
 
 	//GRIDDING SPECIFIC FUNCTIONS
@@ -212,12 +216,12 @@ extern "C" {
 
 
 	//DECONVOLUTION FUNCTIONS
-	int performing_deconvolution(Config *config, PRECISION *dirty_image, Source *model, PRECISION *psf);
+	int performing_deconvolution(Config *config, PRECISION *d_output_image, PRECISION3 *d_sources, PRECISION *psf);
 
 	__global__ void find_max_source_row_reduction(const PRECISION *residual, PRECISION3 *local_max, const int image_size);
 
 	__global__ void find_max_source_col_reduction(PRECISION3 *sources, const PRECISION3 *local_max, const int cycle_number,
-		const int image_size, const PRECISION loop_gain, const double flux, const double weak_source_percent,
+		const int image_size, const PRECISION loop_gain, const double weak_source_percent,
 		const double noise_detection_factor);
 
 	__global__ void subtract_psf_from_residual(PRECISION *residual, PRECISION3 *sources, const PRECISION *psf, 

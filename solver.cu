@@ -42,9 +42,14 @@
 
 #include "solver.h"
 
+// Flags early termination of deconvolution GPU kernels
+__device__ bool d_exit_early = false;
+// Tracks number of distinct extracted sources (compressed)
+__device__ int d_source_counter = 0;
+
 void init_config(Config *config)
 {
-	config->grid_size = 4500;
+	config->grid_size = 18000;
 	
 	config->right_ascension = true;
 
@@ -70,18 +75,18 @@ void init_config(Config *config)
 	// Number of visibilities to process
 	config->num_visibilities = 100;
 
-	config->output_image_file = "../../gridder_test_data/grids/output_image.csv";
+	config->output_dirty_image = "../data/dirty_image.csv";
 
 	// File location to load pre-calculated w-projection kernel
-	config->kernel_real_source_file = "../../gridder_test_data/339_plane_4x/w-proj_kernels_real.csv";
+	config->kernel_real_source_file = "../data/w-proj_kernels_real.csv";
 
-	config->kernel_imag_source_file = "../../gridder_test_data/339_plane_4x/w-proj_kernels_imag.csv";
+	config->kernel_imag_source_file = "../data/w-proj_kernels_imag.csv";
 
 	// Specify file which holds the supports for all kernels
-	config->kernel_support_file = "../../gridder_test_data/339_plane_4x/w-proj_supports.csv";
+	config->kernel_support_file = "../data/w-proj_supports.csv";
 
 	// File location to load visibility uvw coordinates  
-	config->visibility_source_file = "../../gridder_test_data/el82-70.txt";   
+	config->visibility_source_file = "../data/el82-70.txt";   
 
 	// Number of CUDA threads per block - this is GPU specific
 	config->gpu_max_threads_per_block = 1024;
@@ -92,8 +97,32 @@ void init_config(Config *config)
 	// Enable/disable CUDA timing of gridding kernel 
 	config->time_gridding = true; 
 
+	// Enable/disable CUDA timing of deconvolution kernel 
+	config->time_deconvolution = true; 	
+
 	//Enable/disable the iFFT and Convolution Correction part of the pipeline.
 	config->perform_iFFT_CC = true;
+
+	// Enable/disable the execution of Hogbom CLEAN on gridded data
+	config->perform_deconvolution = true;
+
+	config->psf_size = 18000;
+
+	config->psf_source_file = "../data/el8270_psf_9000k_real.csv";
+
+	config->output_residual_image = "../data/residual_image.csv";
+
+	config->number_minor_cycles = 60;
+
+	config->loop_gain = 0.1; // 0.1 is typical
+
+	config->output_model_sources_file = "../data/model_sources.csv";
+
+	config->weak_source_percent = 0.01; // ex: 0.01 = 1%
+
+	// Used to determine if we are extracting noise, based on the assumption
+	// that located source < noise_detection_factor * running_average
+	config->noise_detection_factor = 2.0;
 }
 
 void execute_gridding(Config *config, Visibility *vis_uvw, 
@@ -442,10 +471,6 @@ void copy_image_from_gpu(Config *config, PRECISION *d_image, PRECISION *output_i
 	CUDA_CHECK_RETURN(cudaMemcpy(output_image, d_image, config->grid_size * config->grid_size * sizeof(PRECISION),
  		cudaMemcpyDeviceToHost));
 	cudaDeviceSynchronize();
-
-	// Clean up
-	CUDA_CHECK_RETURN(cudaFree(d_image));
-	//CUDA_CHECK_RETURN(cudaDeviceReset());
 }
 
 
@@ -456,16 +481,12 @@ void copy_complex_image_from_gpu(Config *config, PRECISION2 *d_image, Complex *o
 	CUDA_CHECK_RETURN(cudaMemcpy(output_image, d_image, config->grid_size * config->grid_size * sizeof(PRECISION2),
  		cudaMemcpyDeviceToHost));
 	cudaDeviceSynchronize();
-
-	// Clean up
-	CUDA_CHECK_RETURN(cudaFree(d_image));
-	//CUDA_CHECK_RETURN(cudaDeviceReset());
 }
 
 
-void save_image_to_file(Config *config, PRECISION *grid, int startX, int rangeX, int startY, int rangeY)
+void save_image_to_file(Config *config, PRECISION *grid, int startX, int rangeX, int startY, int rangeY, char *file_path)
 {
-    FILE *file_real = fopen(config->output_image_file, "w");
+    FILE *file_real = fopen(file_path, "w");
   
     if(!file_real)
 	{	
@@ -493,9 +514,37 @@ void save_image_to_file(Config *config, PRECISION *grid, int startX, int rangeX,
     fclose(file_real);
 }
 
+bool load_image_from_file(PRECISION *image, unsigned int size, char *input_file)
+{
+	FILE *file = fopen(input_file, "r");
+
+	if(file == NULL)
+	{
+		printf(">>> ERROR: Unable to load image from file...\n\n");
+		return false;
+	}
+
+	for(int row = 0; row < size; ++row)
+	{
+		for(int col = 0; col < size; ++col)
+		{
+			int image_index = row * size + col;
+
+			#if SINGLE_PRECISION
+				fscanf(file, "%f ", &(image[image_index]));
+			#else
+				fscanf(file, "%lf ", &(image[image_index]));
+			#endif
+		}
+	}
+
+	fclose(file);
+	return true;
+}
+
 void save_complex_image_to_file(Config *config, Complex *grid, int startX, int rangeX, int startY, int rangeY)
 {
-    FILE *file_real = fopen(config->output_image_file, "w");
+    FILE *file_real = fopen(config->output_dirty_image, "w");
     //FILE *file_imag = fopen(config->grid_imag_dest_file, "w");
 
     if(!file_real )
@@ -643,6 +692,246 @@ bool load_visibilities(Config *config, Visibility **vis_uvw, Complex **vis_inten
 	return true;
 }
 
+void allocate_resources(PRECISION **dirty_image, Source **model, PRECISION **psf,
+	unsigned int image_size, unsigned int psf_size, unsigned int num_minor_cycles)
+{
+	*psf = (PRECISION*) calloc(psf_size * psf_size, sizeof(PRECISION));
+	*model = (Source*) calloc(num_minor_cycles, sizeof(Source));
+}
+
+int performing_deconvolution(Config *config, PRECISION *d_output_image, PRECISION3 *d_sources, PRECISION *psf)
+{
+	PRECISION3 *d_max_locals;
+	PRECISION *d_psf;
+
+	//copy the psf over to GPU
+	int psf_size_square = config->psf_size * config->psf_size;
+	CUDA_CHECK_RETURN(cudaMalloc(&d_psf, sizeof(PRECISION) * psf_size_square));
+	CUDA_CHECK_RETURN(cudaMemcpy(d_psf, psf, sizeof(PRECISION) * psf_size_square, cudaMemcpyHostToDevice));
+	cudaDeviceSynchronize();
+
+	CUDA_CHECK_RETURN(cudaMalloc(&d_max_locals, sizeof(PRECISION3) * config->grid_size));	
+
+	// row reduction configuration
+	int max_threads_per_block = min(config->gpu_max_threads_per_block, config->grid_size);
+	int num_blocks = (int) ceil((double) config->grid_size / max_threads_per_block);
+	dim3 reduction_blocks(num_blocks, 1, 1);
+	dim3 reduction_threads(config->gpu_max_threads_per_block, 1, 1);
+
+	// PSF subtraction configuration
+	int max_psf_threads_per_block_dim = min(config->gpu_max_threads_per_block_dimension, config->psf_size);
+	int num_blocks_psf = (int) ceil((double) config->psf_size / max_psf_threads_per_block_dim);
+	dim3 psf_blocks(num_blocks_psf, num_blocks_psf, 1);
+	dim3 psf_threads(max_psf_threads_per_block_dim, max_psf_threads_per_block_dim, 1);
+
+	int cycle_number = 0;
+	bool exit_early = false;
+
+	// optional timing start
+	cudaEvent_t start, stop;
+	if(config->time_deconvolution)
+	{
+		cudaEventCreate(&start);
+		cudaEventCreate(&stop);
+		cudaEventRecord(start);
+	}
+
+	while(cycle_number < config->number_minor_cycles)
+	{
+		// Find local row maximum via reduction
+		find_max_source_row_reduction<<<reduction_blocks, reduction_threads>>>
+			(d_output_image, d_max_locals, config->grid_size);
+		cudaDeviceSynchronize();
+
+		// Find final image maximum via column reduction (local maximums array)
+		find_max_source_col_reduction<<<1, 1>>>
+			(d_sources, d_max_locals, cycle_number, config->grid_size, config->loop_gain, 
+			 config->weak_source_percent, config->noise_detection_factor);
+		cudaDeviceSynchronize();
+
+		subtract_psf_from_residual<<<psf_blocks, psf_threads>>>
+				(d_output_image, d_sources, d_psf, cycle_number, config->grid_size, config->psf_size, config->loop_gain);
+		cudaDeviceSynchronize();
+
+		compress_sources<<<1, 1>>>(d_sources);
+		cudaDeviceSynchronize();
+
+		cudaMemcpyFromSymbol(&exit_early, d_exit_early, sizeof(bool), 0, cudaMemcpyDeviceToHost);
+		cudaDeviceSynchronize();
+
+		if(exit_early)
+		{
+			printf(">>> UPDATE: Terminating minor cycles as now just cleaning noise...\n\n");
+			break;
+		}
+
+		++cycle_number;
+	}
+
+	// optional timing end
+	if(config->time_deconvolution)
+	{
+		cudaEventRecord(stop);
+		cudaEventSynchronize(stop);
+		float milliseconds = 0;
+		cudaEventElapsedTime(&milliseconds, start, stop);
+		printf(">>> GPU Hogbom completed in %f ms for total cycles %d (average %f ms per cycle)...\n\n", 
+			milliseconds, cycle_number, milliseconds / cycle_number);
+	}
+
+	// Clean up unneccesary gpu memory
+	CUDA_CHECK_RETURN(cudaFree(d_max_locals));
+	CUDA_CHECK_RETURN(cudaFree(d_psf));
+	cudaDeviceSynchronize();
+
+	int number_of_sources_found = 0;
+	cudaMemcpyFromSymbol(&number_of_sources_found, d_source_counter, sizeof(int), 0, cudaMemcpyDeviceToHost);
+	cudaDeviceSynchronize();
+
+	return number_of_sources_found;
+}
+
+__global__ void find_max_source_row_reduction(const PRECISION *residual, PRECISION3 *local_max, const int image_size)
+{
+	unsigned int row_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if(row_index >= image_size)
+		return;
+
+	// l, m, intensity 
+	// just going to borrow the "m" or y coordinate and use to find the average in this row.
+	//PRECISION3 max = MAKE_PRECISION3(0.0, (double) row_index, residual[row_index * image_size]);
+	PRECISION3 max = MAKE_PRECISION3(0.0, ABS(residual[row_index * image_size]), residual[row_index * image_size]);
+	PRECISION current;
+
+	for(int col_index = 1; col_index < image_size; ++col_index)
+	{
+		current = residual[row_index * image_size + col_index];
+		max.y += ABS(current);
+		if(ABS(current) > ABS(max.z))
+		{
+			// update m and intensity
+			max.x = (double) col_index;
+			max.z = current;
+		}
+	}
+	
+	local_max[row_index] = max;
+}
+
+__global__ void find_max_source_col_reduction(PRECISION3 *sources, const PRECISION3 *local_max, const int cycle_number,
+	const int image_size, const PRECISION loop_gain, const double weak_source_percent,
+	const double noise_detection_factor)
+{
+	unsigned int col_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if(col_index >= 1) // only single threaded
+		return;
+
+	//obtain max from row and col and clear the y (row) coordinate.
+	PRECISION3 max = local_max[0];
+	PRECISION running_avg = local_max[0].y;
+	max.y = 0.0;
+
+	PRECISION3 current;
+	
+	for(int index = 1; index < image_size; ++index)
+	{
+		current = local_max[index];
+		running_avg += current.y;		
+		current.y = index;
+
+		if(ABS(current.z) > ABS(max.z))
+			max = current;
+	}
+
+	running_avg /= (image_size * image_size);
+	max.z *= loop_gain;
+	
+	// determine whether we drop out and ignore this source
+	bool extracting_noise = max.z < noise_detection_factor * running_avg * loop_gain;
+	bool weak_source = max.z < sources[0].z * weak_source_percent;
+	d_exit_early = extracting_noise || weak_source;
+
+	if(d_exit_early)
+		return;
+
+	// source was reasonable, so we keep it
+	sources[d_source_counter] = max;
+	++d_source_counter;
+}
+
+__global__ void compress_sources(PRECISION3 *sources)
+{
+	unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if(index >= 1) // only single threaded
+		return;
+
+	PRECISION3 last_source = sources[d_source_counter - 1];
+	for(int i = d_source_counter - 2; i >= 0; --i)
+	{
+		if((int)last_source.x == (int)sources[i].x && (int)last_source.y == (int)sources[i].y)
+		{
+			sources[i].z += last_source.z;
+			--d_source_counter;
+			break;
+		}
+	}
+}
+
+__global__ void subtract_psf_from_residual(PRECISION *residual, PRECISION3 *sources, const PRECISION *psf, 
+	const int cycle_number, const int image_size, const int psf_size, const PRECISION loop_gain)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	// thread out of bounds
+	if(idx >= psf_size || idy >= psf_size)
+		return;
+
+	const int half_psf_size = psf_size / 2;
+
+	// Determine image coordinates relative to source location
+	int2 image_coord = make_int2(
+		sources[d_source_counter-1].x - half_psf_size + idx,
+		sources[d_source_counter-1].y - half_psf_size + idy
+	);
+	
+	// image coordinates fall out of bounds
+	if(image_coord.x < 0 || image_coord.x >= image_size || image_coord.y < 0 || image_coord.y >= image_size)
+		return;
+
+	// Get required psf sample for subtraction
+	const PRECISION psf_weight = psf[idy * psf_size + idx];
+
+	// Subtract shifted psf sample from residual image
+	residual[image_coord.y * image_size + image_coord.x] -= psf_weight  * sources[d_source_counter-1].z;
+}
+
+void save_sources_to_file(Source *source, int number_of_sources, char *output_file)
+{
+	FILE *file = fopen(output_file, "w");
+
+	if(file == NULL)
+	{
+		printf(">>> ERROR: Unable to save sources to file, moving on...\n\n");
+		return;
+	}
+
+	fprintf(file, "%d\n", number_of_sources);
+	for(int index = 0; index < number_of_sources; ++index)
+	{
+		#if SINGLE_PRECISION
+			fprintf(file, "%f %f %f\n", source[index].l, source[index].m, source[index].intensity);
+		#else
+			fprintf(file, "%.15f %.15f %.15f\n", source[index].l, source[index].m, source[index].intensity);
+		#endif
+	}
+
+	fclose(file);
+}
+
 void clean_up_gridding_inputs(Complex **grid, Visibility **vis_uvw, Complex **vis_intensities,
 	Complex **kernel, int2 **kernel_supports)
 {
@@ -653,14 +942,11 @@ void clean_up_gridding_inputs(Complex **grid, Visibility **vis_uvw, Complex **vi
 	if(*kernel_supports) free(*kernel_supports);
 }
 
-
-
-
 /**
  * Check the return value of the CUDA runtime API call and exit
  * the application if the call has failed.
  */
-static void check_cuda_error_aux(const char *file, unsigned line, const char *statement, cudaError_t err)
+void check_cuda_error_aux(const char *file, unsigned line, const char *statement, cudaError_t err)
 {
 	if (err == cudaSuccess)
 		return;
@@ -669,7 +955,7 @@ static void check_cuda_error_aux(const char *file, unsigned line, const char *st
 	exit(EXIT_FAILURE);
 }
 
-static void cufft_safe_call(cufftResult err, const char *file, const int line)
+void cufft_safe_call(cufftResult err, const char *file, const int line)
 {
     if( CUFFT_SUCCESS != err) {
 		printf("CUFFT error in file '%s', line %d\nerror %d: %s\nterminating!\n",
@@ -678,7 +964,7 @@ static void cufft_safe_call(cufftResult err, const char *file, const int line)
     }
 }
 
-static const char* cuda_get_error_enum(cufftResult error)
+const char* cuda_get_error_enum(cufftResult error)
 {
     switch (error)
     {
